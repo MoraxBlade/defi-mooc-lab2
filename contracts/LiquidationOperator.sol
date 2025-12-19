@@ -108,6 +108,9 @@ interface IUniswapV2Pair {
      * Swaps tokens. For regular swaps, data.length must be 0.
      * Also see [Flash Swaps](https://docs.uniswap.org/protocol/V2/concepts/core-concepts/flash-swaps).
      **/
+
+    function token0() external view returns (address);
+    function token1() external view returns (address);
     function swap(
         uint256 amount0Out,
         uint256 amount1Out,
@@ -138,7 +141,20 @@ contract LiquidationOperator is IUniswapV2Callee {
     // TODO: define constants used in the contract including ERC-20 tokens, Uniswap Pairs, Aave lending pools, etc. */
     //    *** Your code here ***
     // END TODO
+    address public constant AAVE_LENDING_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;//pool
+    address public constant TARGET_USER = 0x59CE4a2AC5bC3f5F225439B2993b86B42f6d3e9F;//user
+    address public constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    //ILendingPool constant lendingPool = ILendingPool(0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9);
 
+    IERC20 public constant USDT = IERC20(0xdAC17F958D2ee523a2206206994597C13D831ec7); // 显式声明IERC20
+    IERC20 public constant WBTC = IERC20(0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599); // 显式声明IERC20
+    IWETH public constant WETH = IWETH(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2); // 显式声明IWETH
+ 
+    uint debt_USDT;//声明债务
+
+    ILendingPool public immutable lendingPool;
+    IUniswapV2Pair public immutable uniswapV2Pair_WETH_USDT; // Pool1
+    IUniswapV2Pair public immutable uniswapV2Pair_WBTC_WETH; // Pool2
     // some helper function, it is totally fine if you can finish the lab without using these function
     // https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2Library.sol
     // given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset
@@ -176,34 +192,63 @@ contract LiquidationOperator is IUniswapV2Callee {
         uint256 denominator = (reserveOut - amountOut) * 997;
         amountIn = (numerator / denominator) + 1;
     }
+    
 
+
+    
     constructor() {
         // TODO: (optional) initialize your contract
         //   *** Your code here ***
         // END TODO
+        lendingPool = ILendingPool(AAVE_LENDING_POOL);
+        uniswapV2Pair_WETH_USDT = IUniswapV2Pair(IUniswapV2Factory(UNISWAP_V2_FACTORY).getPair(address(WETH), address(USDT)));
+        uniswapV2Pair_WBTC_WETH = IUniswapV2Pair(IUniswapV2Factory(UNISWAP_V2_FACTORY).getPair(address(WBTC), address(WETH)));
+        debt_USDT=2000000 * 10**6;
     }
 
     // TODO: add a `receive` function so that you can withdraw your WETH
     //   *** Your code here ***
     // END TODO
-
+    receive() external payable {}
     // required by the testing script, entry for your liquidation call
     function operate() external {
         // TODO: implement your liquidation logic
 
         // 0. security checks and initializing variables
         //    *** Your code here ***
-
+        require(msg.sender != address(0), "LiquidationOperator: INVALID_SENDER");
         // 1. get the target user account data & make sure it is liquidatable
         //    *** Your code here ***
-
+        uint256 totalCollateralETH;
+        uint256 totalDebtETH;
+        uint256 availableBorrowsETH;
+        uint256 currentLiquidationThreshold;
+        uint256 ltv;
+        uint256 healthFactor;
+        (
+            totalCollateralETH,
+            totalDebtETH,
+            availableBorrowsETH,
+            currentLiquidationThreshold,
+            ltv,
+            healthFactor
+        ) = lendingPool.getUserAccountData(TARGET_USER);
+        console.log("Target user health factor:", healthFactor);
+        require(healthFactor < 1 ether, "LiquidationOperator: USER_NOT_LIQUIDATABLE");
         // 2. call flash swap to liquidate the target user
         // based on https://etherscan.io/tx/0xac7df37a43fab1b130318bbb761861b8357650db2e2c6493b73d6da3d9581077
+        
         // we know that the target user borrowed USDT with WBTC as collateral
         // we should borrow USDT, liquidate the target user and get the WBTC, then swap WBTC to repay uniswap
         // (please feel free to develop other workflows as long as they liquidate the target user successfully)
         //    *** Your code here ***
-
+        bytes memory flashLoanData = abi.encode(msg.sender);
+        uniswapV2Pair_WETH_USDT.swap(
+            0, // 不借 token0（WETH）
+            debt_USDT, // 借 debt_USDT 数量的 token1（USDT）
+            address(this), // 本合约接收 USDT
+            flashLoanData // 传递利润接收者地址
+        );
         // 3. Convert the profit into ETH and send back to sender
         //    *** Your code here ***
 
@@ -212,25 +257,110 @@ contract LiquidationOperator is IUniswapV2Callee {
 
     // required by the swap
     function uniswapV2Call(
-        address,
-        uint256,
+        address sender,
+        uint256 amount0,
         uint256 amount1,
-        bytes calldata
+        bytes calldata data
     ) external override {
         // TODO: implement your liquidation logic
 
         // 2.0. security checks and initializing variables
         //    *** Your code here ***
-
+        require(msg.sender == address(uniswapV2Pair_WETH_USDT),"LiquidationOperator: ONLY_WETH_USDT_PAIR");
+        require(sender == address(this),"LiquidationOperator: ONLY_SELF_TRIGGER");
+        require(amount0 == 0 && amount1 > 0,"LiquidationOperator: WRONG_FLASHLOAN_ASSET");
+        address profitReceiver = abi.decode(data, (address));
+        require(profitReceiver != address(0),"LiquidationOperator: INVALID_PROFIT_RECEIVER");
+        
+        
         // 2.1 liquidate the target user
         //    *** Your code here ***
+        USDT.approve(address(lendingPool), amount1);
+        
+        console.log("USDT balance before liquidation:", USDT.balanceOf(address(this)));
 
+        lendingPool.liquidationCall(address(WBTC), address(USDT), TARGET_USER,amount1, false);
+
+        uint256 receivedWBTC = WBTC.balanceOf(address(this));
+        console.log("Received WBTC from liquidation:", receivedWBTC); 
+        require(receivedWBTC > 0,"LiquidationOperator: NO_WBTC_FROM_LIQUIDATION");
+        
+        
         // 2.2 swap WBTC for other things or repay directly
         //    *** Your code here ***
-
+        uint256 swapWETHOut = _swapWBTCToWETH(receivedWBTC);
+        require(swapWETHOut > 0, "LiquidationOperator: INSUFFICIENT_WETH_OUTPUT");
+        
         // 2.3 repay
         //    *** Your code here ***
+        _repayFlashLoan(amount1, profitReceiver);
+    }
+
+    function _swapWBTCToWETH(uint256 receivedWBTC) internal returns (uint256) {
+        bool isWBTCtoken0 = (uniswapV2Pair_WBTC_WETH.token0() == address(WBTC));
+        console.log("Is WBTC token0 in WBTC-WETH pair?", isWBTCtoken0);
         
-        // END TODO
+        (uint112 reserveWBTC, uint112 reserveWETH, ) = uniswapV2Pair_WBTC_WETH.getReserves();
+        if (!isWBTCtoken0) (reserveWBTC, reserveWETH) = (reserveWETH, reserveWBTC);
+        
+        // 每次兑换不超过储备金的 5%，避免滑点过大
+        uint256 maxPerSwap = uint256(reserveWBTC) * 5 / 100; // 5% 储备金
+        uint256 remaining = receivedWBTC;
+        uint256 totalWETH;
+        while (remaining > 0) {
+            uint256 swapAmount = remaining < maxPerSwap ? remaining : maxPerSwap;
+            uint256 wethOut = getAmountOut(swapAmount, uint256(reserveWBTC), uint256(reserveWETH));
+            
+            WBTC.approve(address(uniswapV2Pair_WBTC_WETH), swapAmount);
+            WBTC.transfer(address(uniswapV2Pair_WBTC_WETH), swapAmount);
+            
+            if (isWBTCtoken0) {
+                uniswapV2Pair_WBTC_WETH.swap(0, wethOut, address(this), new bytes(0));
+            } else {
+                uniswapV2Pair_WBTC_WETH.swap(wethOut, 0, address(this), new bytes(0));
+            }
+            
+            totalWETH += wethOut;
+            remaining -= swapAmount;
+            
+            // 更新储备金（避免重复计算导致的误差）
+            (reserveWBTC, reserveWETH, ) = uniswapV2Pair_WBTC_WETH.getReserves();
+            if (!isWBTCtoken0) (reserveWBTC, reserveWETH) = (reserveWETH, reserveWBTC);
+        }
+        return totalWETH;
+    }
+
+    function _repayFlashLoan(uint256 amount1, address profitReceiver) internal {
+        // 计算需偿还的 USDT（含手续费）
+        uint256 usdtToRepay = amount1;
+        console.log("USDT to repay (with fee):", usdtToRepay);
+
+        // 计算所需 WETH 数量
+        bool isWETHToken0 = (uniswapV2Pair_WETH_USDT.token0() == address(WETH));
+        (uint112 reserveWETH, uint112 reserveUSDT, ) = uniswapV2Pair_WETH_USDT.getReserves();
+        if (!isWETHToken0) (reserveWETH, reserveUSDT) = (reserveUSDT, reserveWETH);
+        
+        uint256 wethToRepay = getAmountIn(usdtToRepay, uint256(reserveWETH), uint256(reserveUSDT));
+        require(wethToRepay > 0, "LiquidationOperator: INSUFFICIENT_WETH_TO_REPAY");
+        console.log("WETH needed to repay:", wethToRepay);
+
+        // 3. 确保 WETH 余额足够
+        uint256 currentWETH = WETH.balanceOf(address(this));
+        require(currentWETH >= wethToRepay, "LiquidationOperator: NOT_ENOUGH_WETH");
+
+        // 4. 直接转移 WETH 到 WETH-USDT 交易对完成偿还（无 swap 调用）
+        WETH.approve(address(uniswapV2Pair_WETH_USDT), wethToRepay);
+        bool wethRepaySuccess = WETH.transfer(address(uniswapV2Pair_WETH_USDT), wethToRepay);
+        require(wethRepaySuccess, "LiquidationOperator: WETH_REPAY_FAILED");
+        console.log("WETH repaid to pair:", wethToRepay);
+
+        // 5. 转移剩余利润（WETH 转 ETH）
+        uint256 remainingWETH = WETH.balanceOf(address(this));
+        if (remainingWETH > 0) {
+            WETH.withdraw(remainingWETH);
+            (bool success, ) = profitReceiver.call{value: remainingWETH}("");
+            require(success, "LiquidationOperator: PROFIT_TRANSFER_FAILED");
+        }
     }
 }
+
